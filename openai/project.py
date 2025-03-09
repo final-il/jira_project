@@ -2,46 +2,103 @@
 """
 Jira Project Bootstrapping Script for Azure AI Integration Project
 
-This script creates a Jira project (if permissions allow) and populates it with epics and detailed stories
+This script creates a Jira project (if it doesn’t exist) and then populates it with epics and detailed stories
 based on the project plan for integrating Azure AI with on-prem connectivity, Terraform automation, and Jenkins integration.
 
 Requirements:
 - Python 3.x
 - jira module (install via: pip install jira)
-- Update the JIRA_URL, JIRA_EMAIL, and JIRA_API_TOKEN variables as needed.
+- A file named 'values.env' located two directories up, with the structure:
+      JIRA_API_TOKEN = "ATATT3xFfGF04hG7JMG5s5XXXXXXX"
+- Ensure that your account has the required Jira admin permissions to create projects.
 """
 
+import os
+import sys
 from jira import JIRA
+
+def read_jira_api_token():
+    """
+    Reads the JIRA_API_TOKEN from a file located two directories up in a file named values.env.
+    Expected file content example:
+        JIRA_API_TOKEN = "ATATT3xFfGF04hG7JMG5s5XXXXXXX"
+    """
+    file_path = os.path.join(os.path.dirname(__file__), "..", "..", "values.env")
+    token = None
+    try:
+        with open(file_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                # Skip empty or commented lines
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("JIRA_API_TOKEN"):
+                    # Split by "=" and remove surrounding quotes
+                    parts = line.split("=", 1)
+                    if len(parts) == 2:
+                        token = parts[1].strip().strip('"')
+                        break
+    except Exception as e:
+        print(f"Error reading API token from {file_path}: {e}")
+        sys.exit(1)
+    if not token:
+        print(f"JIRA_API_TOKEN not found in {file_path}")
+        sys.exit(1)
+    return token
 
 # Jira connection details
 JIRA_URL = "https://jira-final-il.atlassian.net/"  # or https://<your-jira-domain>/jira if self-managed
 JIRA_EMAIL = "maorb@final.co.il"  # Or username for on-prem Jira
-JIRA_API_TOKEN =    # Your API token
+JIRA_API_TOKEN = read_jira_api_token()   # Read token from file
 
 # Set up Jira connection
 options = {'server': JIRA_URL}
 jira = JIRA(options, basic_auth=(JIRA_EMAIL, JIRA_API_TOKEN))
 
-# Define project details (adjust as needed)
+# Define project details
 project_key = 'AZAI'
 project_name = 'Azure AI Integration Project'
-project_type = 'software'
-project_template_key = 'com.pyxis.greenhopper.jira:gh-simplified-agility-scrum'  # Adjust if needed
+project_description = ("Project for integrating Azure AI with on-prem connectivity, "
+                       "Terraform automation, and Jenkins integration.")
 
-# Function to create project (requires admin privileges)
 def create_project():
+    """
+    Creates a Jira project using the REST API directly.
+    For Jira Cloud, you must provide the leadAccountId (retrieved via jira.myself()).
+    """
+    # Get the account ID of the current user
     try:
-        project = jira.create_project(key=project_key, name=project_name,
-                                      projectTypeKey=project_type, templateKey=project_template_key)
-        print(f"Project '{project_name}' created successfully.")
-        return project
+        me = jira.myself()
+        lead_account_id = me['accountId']
     except Exception as e:
-        print(f"Project creation failed (possibly due to permissions): {e}")
-        print(f"Assuming project '{project_key}' already exists.")
-        return None
+        print("Failed to retrieve your account details: ", e)
+        sys.exit(1)
 
-# Uncomment the following line to create the project if you have permissions
-# create_project()
+    payload = {
+        "key": project_key,
+        "name": project_name,
+        "projectTypeKey": "software",
+        "projectTemplateKey": "com.pyxis.greenhopper.jira:gh-simplified-agility-scrum",
+        "description": project_description,
+        "leadAccountId": lead_account_id,
+        "assigneeType": "PROJECT_LEAD"
+    }
+    url = JIRA_URL.rstrip("/") + "/rest/api/3/project"
+    response = jira._session.post(url, json=payload)
+    if response.status_code != 201:
+        print("Failed to create project: " + response.text)
+        sys.exit(1)
+    else:
+        print("Project created successfully.")
+        return response.json()
+
+# Check if the project exists; if not, create it.
+try:
+    project = jira.project(project_key)
+    print(f"Project '{project_key}' found: {project.name}")
+except Exception as e:
+    print(f"Project '{project_key}' not found. Creating it...")
+    project = create_project()
 
 # Define epics with their detailed descriptions
 epics = [
@@ -148,7 +205,7 @@ detailed_tasks = [
      "description": "Configure job monitoring and integrate alerts with tools like Slack or Teams."},
 ]
 
-# Note: The custom field for linking to an epic may differ; for many Jira Cloud instances it is 'customfield_10008'.
+# The custom field for linking issues to epics in many Jira Cloud instances is 'customfield_10008'.
 EPIC_LINK_FIELD = 'customfield_10008'
 
 for task in detailed_tasks:
