@@ -8,24 +8,17 @@ from difflib import SequenceMatcher
 import sys
 import argparse  # Add this import
 
-# Logging setup
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S',
-    force=True  # Ensure our logging configuration takes precedence
-)
+# Check if the root logger already has handlers
+if not logging.getLogger().handlers:
+    # Configure the root logger
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
 
+# Get the logger for this module
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
-
-# Add a console handler if one doesn't exist
-if not logger.handlers:
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.DEBUG)
-    formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
-    console_handler.setFormatter(formatter)
-    logger.addHandler(console_handler)
 
 logger.info("Starting script execution...")
 logger.info("Current working directory: %s", os.getcwd())
@@ -176,6 +169,8 @@ def parse_arguments():
                         help='Project key (default: ITDVPS)')
     parser.add_argument('-q', '--quarter', type=str, choices=['Q1', 'Q2', 'Q3', 'Q4'],
                         help='Quarter (Q1, Q2, Q3, Q4). If not provided, will use next quarter')
+    parser.add_argument('-u', '--update', action='store_true',
+                        help='Update existing issues instead of skipping them')
     return parser.parse_args()
 
 # Test issue creation with minimal fields
@@ -261,6 +256,7 @@ try:
     failed_fields = []
     skipped_issues = []  # New list to track skipped issues
     created_issues = []  # New list to track created issues
+    updated_issues = []  # New list to track updated issues
 
     def check_issue_exists(summary, project_key):
         """Check if an issue with the given summary already exists in the project"""
@@ -270,6 +266,15 @@ try:
             return len(existing_issues) > 0
         except Exception as e:
             logger.error(f"Error checking for existing issue: {e}")
+            return False
+
+    def update_issue_fields(issue, fields_to_update):
+        """Update fields of an existing issue"""
+        try:
+            issue.update(fields=fields_to_update)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to update issue {issue.key}: {e}")
             return False
 
     # Process rows
@@ -313,7 +318,9 @@ try:
         try:
             if issue_type and issue_type.lower() == 'epic':
                 # Check if epic already exists
-                if check_issue_exists(project_name, DEFAULT_PROJECT_KEY):
+                existing_issues = jira.search_issues(f'project="{DEFAULT_PROJECT_KEY}" AND summary~"{project_name}"', maxResults=1)
+                
+                if existing_issues and not args.update:
                     logger.info(f"Epic '{project_name}' already exists, skipping creation")
                     skipped_issues.append(f"Epic: {project_name}")
                     continue
@@ -323,13 +330,26 @@ try:
                     epic_fields['parent'] = {'key': parent_link}
                 else:
                     epic_fields['project'] = {'key': DEFAULT_PROJECT_KEY}
-                issue = jira.create_issue(fields=epic_fields)
-                logger.info(f"Epic created: {issue.key}")
-                created_issues.append(f"Epic: {project_name} ({issue.key})")
+                
+                if existing_issues and args.update:
+                    # Update existing epic
+                    issue = existing_issues[0]
+                    if update_issue_fields(issue, epic_fields):
+                        logger.info(f"Epic updated: {issue.key}")
+                        updated_issues.append(f"Epic: {project_name} ({issue.key})")
+                    else:
+                        failed_tasks.append(f"Row {idx + 2}: {project_name} - Failed to update epic")
+                else:
+                    # Create new epic
+                    issue = jira.create_issue(fields=epic_fields)
+                    logger.info(f"Epic created: {issue.key}")
+                    created_issues.append(f"Epic: {project_name} ({issue.key})")
 
             elif issue_type and issue_type.lower() == 'qbv':
                 # Check if QBV already exists
-                if check_issue_exists(project_name, QBV_PROJECT_KEY):
+                existing_issues = jira.search_issues(f'project="{QBV_PROJECT_KEY}" AND summary~"{project_name}"', maxResults=1)
+                
+                if existing_issues and not args.update:
                     logger.info(f"QBV '{project_name}' already exists, skipping creation")
                     skipped_issues.append(f"QBV: {project_name}")
                     continue
@@ -357,9 +377,19 @@ try:
                         logger.warning(f"Could not find Jira user for lead '{lead}' at row {idx + 2}")
                         failed_users.append(f"Row {idx + 2}: {project_name} - Could not find Jira user for lead '{lead}'")
                 
-                issue = jira.create_issue(fields=qbv_fields)
-                logger.info(f"QBV issue created: {issue.key}")
-                created_issues.append(f"QBV: {project_name} ({issue.key})")
+                if existing_issues and args.update:
+                    # Update existing QBV
+                    issue = existing_issues[0]
+                    if update_issue_fields(issue, qbv_fields):
+                        logger.info(f"QBV updated: {issue.key}")
+                        updated_issues.append(f"QBV: {project_name} ({issue.key})")
+                    else:
+                        failed_tasks.append(f"Row {idx + 2}: {project_name} - Failed to update QBV")
+                else:
+                    # Create new QBV
+                    issue = jira.create_issue(fields=qbv_fields)
+                    logger.info(f"QBV issue created: {issue.key}")
+                    created_issues.append(f"QBV: {project_name} ({issue.key})")
 
             elif issue_type and issue_type.lower() == 'project':
                 existing_issues = jira.search_issues(f'project="{DEFAULT_PROJECT_KEY}" AND summary~"{project_name}"')
@@ -379,9 +409,11 @@ try:
                             fields_to_update[field] = value
                     
                     if fields_to_update:
-                        issue.update(fields=fields_to_update)
-                        logger.info(f"Project '{project_name}' updated: {issue.key}")
-                        created_issues.append(f"Project Update: {project_name} ({issue.key})")
+                        if update_issue_fields(issue, fields_to_update):
+                            logger.info(f"Project '{project_name}' updated: {issue.key}")
+                            updated_issues.append(f"Project Update: {project_name} ({issue.key})")
+                        else:
+                            failed_tasks.append(f"Row {idx + 2}: {project_name} - Failed to update project")
                     else:
                         logger.info(f"No fields to update for project '{project_name}'")
                         skipped_issues.append(f"Project Update: {project_name} (no fields to update)")
@@ -391,7 +423,9 @@ try:
 
             elif issue_type and issue_type.lower() == 'on-going':
                 # Check if ongoing issue already exists
-                if check_issue_exists(project_name, DEFAULT_PROJECT_KEY):
+                existing_issues = jira.search_issues(f'project="{DEFAULT_PROJECT_KEY}" AND summary~"{project_name}"', maxResults=1)
+                
+                if existing_issues and not args.update:
                     logger.info(f"On-going issue '{project_name}' already exists, skipping creation")
                     skipped_issues.append(f"On-going: {project_name}")
                     continue
@@ -417,9 +451,19 @@ try:
                         logger.warning(f"Could not find Jira user for lead '{lead}' at row {idx + 2}")
                         failed_users.append(f"Row {idx + 2}: {project_name} - Could not find Jira user for lead '{lead}'")
                 
-                issue = jira.create_issue(fields=story_fields)
-                logger.info(f"On-Going story created under ITDVPS-976: {issue.key}")
-                created_issues.append(f"On-going: {project_name} ({issue.key})")
+                if existing_issues and args.update:
+                    # Update existing ongoing issue
+                    issue = existing_issues[0]
+                    if update_issue_fields(issue, story_fields):
+                        logger.info(f"On-going issue updated: {issue.key}")
+                        updated_issues.append(f"On-going: {project_name} ({issue.key})")
+                    else:
+                        failed_tasks.append(f"Row {idx + 2}: {project_name} - Failed to update on-going issue")
+                else:
+                    # Create new ongoing issue
+                    issue = jira.create_issue(fields=story_fields)
+                    logger.info(f"On-Going story created under ITDVPS-976: {issue.key}")
+                    created_issues.append(f"On-going: {project_name} ({issue.key})")
 
             else:
                 logger.warning(f"Unknown issue type '{issue_type}' at row {idx + 2}")
@@ -432,8 +476,12 @@ try:
     # Add this before the final "Script execution completed" message
     logger.info("\n=== Execution Summary ===")
     if created_issues:
-        logger.info("\nCreated/Updated Issues:")
+        logger.info("\nCreated Issues:")
         for issue in created_issues:
+            logger.info(f"- {issue}")
+    if updated_issues:
+        logger.info("\nUpdated Issues:")
+        for issue in updated_issues:
             logger.info(f"- {issue}")
     if skipped_issues:
         logger.info("\nSkipped Issues (already exist):")
