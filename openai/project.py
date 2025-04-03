@@ -2,15 +2,16 @@
 """
 Jira Project Bootstrapping Script for Azure AI Integration Project
 
-This script creates a Jira project (if it doesn’t exist) and then populates it with epics and detailed stories
-based on the project plan for integrating Azure AI with on-prem connectivity, Terraform automation, and Jenkins integration.
+This script reads the Jira API token from a file (../../values.env), 
+authenticates to Jira Cloud, creates a project (if it doesn’t exist), 
+and then populates it with epics and detailed stories based on the project plan.
 
 Requirements:
 - Python 3.x
 - jira module (install via: pip install jira)
-- A file named 'values.env' located two directories up, with the structure:
+- A file named 'values.env' located two directories up with the structure:
       JIRA_API_TOKEN = "ATATT3xFfGF04hG7JMG5s5XXXXXXX"
-- Ensure that your account has the required Jira admin permissions to create projects.
+- Your account must have Jira administrator permissions to create projects.
 """
 
 import os
@@ -29,11 +30,9 @@ def read_jira_api_token():
         with open(file_path, "r") as f:
             for line in f:
                 line = line.strip()
-                # Skip empty or commented lines
                 if not line or line.startswith("#"):
                     continue
                 if line.startswith("JIRA_API_TOKEN"):
-                    # Split by "=" and remove surrounding quotes
                     parts = line.split("=", 1)
                     if len(parts) == 2:
                         token = parts[1].strip().strip('"')
@@ -55,20 +54,34 @@ JIRA_API_TOKEN = read_jira_api_token()   # Read token from file
 options = {'server': JIRA_URL}
 jira = JIRA(options, basic_auth=(JIRA_EMAIL, JIRA_API_TOKEN))
 
+def check_authentication():
+    """
+    Verifies that the current credentials can access the Jira API v3 endpoint.
+    """
+    url = JIRA_URL.rstrip("/") + "/rest/api/3/myself"
+    response = jira._session.get(url)
+    if response.status_code != 200:
+        print("Authentication failed. Please verify your credentials in values.env.")
+        print(f"Status Code: {response.status_code}, Response: {response.text}")
+        sys.exit(1)
+    return response.json()
+
+# Check authentication before proceeding
+me = check_authentication()
+print(f"Authenticated as: {me.get('displayName', 'Unknown User')}")
+
 # Define project details
-project_key = 'AZAI'
-project_name = 'Azure AI Integration Project'
+project_key = 'AZOAI'
+project_name = 'Azure OpenAI'
 project_description = ("Project for integrating Azure AI with on-prem connectivity, "
                        "Terraform automation, and Jenkins integration.")
 
 def create_project():
     """
     Creates a Jira project using the REST API directly.
-    For Jira Cloud, you must provide the leadAccountId (retrieved via jira.myself()).
+    For Jira Cloud, it requires the leadAccountId from the authenticated user.
     """
-    # Get the account ID of the current user
     try:
-        me = jira.myself()
         lead_account_id = me['accountId']
     except Exception as e:
         print("Failed to retrieve your account details: ", e)
@@ -139,6 +152,9 @@ for epic in epics:
     created_epics[epic["summary"]] = new_issue.key
     print(f"Created epic: {new_issue.key} - {epic['summary']}")
 
+# Use your provided field id for epic linking
+EPIC_LINK_FIELD = 'customfield_10011'
+
 # Define detailed tasks under each epic
 detailed_tasks = [
     # Epic: Network and Private Link Setup
@@ -205,16 +221,21 @@ detailed_tasks = [
      "description": "Configure job monitoring and integrate alerts with tools like Slack or Teams."},
 ]
 
-# The custom field for linking issues to epics in many Jira Cloud instances is 'customfield_10008'.
-EPIC_LINK_FIELD = 'customfield_10008'
-
 for task in detailed_tasks:
-    issue_dict = {
+    # Create the issue without the epic link field
+    issue_fields = {
         'project': {'key': project_key},
         'summary': task["summary"],
         'description': task["description"],
-        'issuetype': {'name': "Story"},
-        EPIC_LINK_FIELD: created_epics[task["epic"]]
+        'issuetype': {'name': "Story"}
     }
-    new_issue = jira.create_issue(fields=issue_dict)
-    print(f"Created story: {new_issue.key} - {task['summary']} under epic '{task['epic']}'")
+    new_issue = jira.create_issue(fields=issue_fields)
+    print(f"Created story: {new_issue.key} - {task['summary']}")
+    # Now update the issue to set the epic link using your custom field id
+    epic_key = created_epics.get(task["epic"])
+    if epic_key:
+        try:
+            new_issue.update(fields={EPIC_LINK_FIELD: epic_key})
+            print(f"Updated {new_issue.key} with epic link {epic_key} for epic '{task['epic']}'")
+        except Exception as ex:
+            print(f"Failed to update epic link for {new_issue.key}: {ex}")

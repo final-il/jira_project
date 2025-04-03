@@ -3,7 +3,7 @@ import csv
 
 JIRA_URL = "https://jira-final-il.atlassian.net/"  # or https://<your-jira-domain>/jira if self-managed
 JIRA_EMAIL = "maorb@final.co.il"  # Or username for on-prem Jira
-JIRA_API_TOKEN =     # Or password for on-prem Jira
+JIRA_API_TOKEN = ""     # Or password for on-prem Jira
 PARENT_ISSUE_KEY = "ITDVPS-731"              # The parent story key
 PROJECT_KEY = "ITDVPS"                       # The project key where the issues live
 
