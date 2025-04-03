@@ -6,6 +6,7 @@ from datetime import datetime
 import logging
 from difflib import SequenceMatcher
 import sys
+import argparse  # Add this import
 
 # Logging setup
 logging.basicConfig(
@@ -167,8 +168,25 @@ def get_allowed_value_id(field_id, search_value, project_key=DEFAULT_PROJECT_KEY
     # Only show allowed values if the search value wasn't found
     raise ValueError(f"Value '{search_value}' not found for field '{field_id}'. Allowed values: {allowed_list}")
 
+# Add this before the script execution
+def parse_arguments():
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(description='Create Jira issues from Excel file')
+    parser.add_argument('-p', '--project', type=str, default='ITDVPS',
+                        help='Project key (default: ITDVPS)')
+    parser.add_argument('-q', '--quarter', type=str, choices=['Q1', 'Q2', 'Q3', 'Q4'],
+                        help='Quarter (Q1, Q2, Q3, Q4). If not provided, will use next quarter')
+    return parser.parse_args()
+
 # Test issue creation with minimal fields
 try:
+    # Parse command line arguments
+    args = parse_arguments()
+    
+    # Set project key from command line argument
+    DEFAULT_PROJECT_KEY = args.project
+    logger.info(f"Using project key: {DEFAULT_PROJECT_KEY}")
+    
     # First verify authentication
     try:
         # Try to get user info to verify authentication
@@ -192,8 +210,17 @@ try:
     try:
         requested_by_group_id = get_allowed_value_id(REQUESTED_BY_GROUP_FIELD_ID, 'Dev')
         year_value_id = get_allowed_value_id(YEAR_FIELD_ID, '2025')
-        current_quarter = ((datetime.today().month - 1) // 3 + 1) % 4 + 1
-        quarter_value_id = get_allowed_value_id(QUARTER_FIELD_ID, f'Q{current_quarter}')
+        
+        # Determine quarter based on command line argument or current date
+        if args.quarter:
+            quarter_value = args.quarter
+            logger.info(f"Using specified quarter: {quarter_value}")
+        else:
+            current_quarter = ((datetime.today().month - 1) // 3 + 1) % 4 + 1
+            quarter_value = f'Q{current_quarter}'
+            logger.info(f"Using next quarter: {quarter_value}")
+        
+        quarter_value_id = get_allowed_value_id(QUARTER_FIELD_ID, quarter_value)
         in_quarter_plan_yes_id = get_allowed_value_id(IN_QUARTER_PLAN_FIELD_ID, 'Yes')
         
         # Get CSI value for QBV group field
@@ -232,6 +259,18 @@ try:
     failed_tasks = []
     failed_users = []
     failed_fields = []
+    skipped_issues = []  # New list to track skipped issues
+    created_issues = []  # New list to track created issues
+
+    def check_issue_exists(summary, project_key):
+        """Check if an issue with the given summary already exists in the project"""
+        try:
+            jql = f'project = {project_key} AND summary ~ "{summary}"'
+            existing_issues = jira.search_issues(jql, maxResults=1)
+            return len(existing_issues) > 0
+        except Exception as e:
+            logger.error(f"Error checking for existing issue: {e}")
+            return False
 
     # Process rows
     for idx, row in df.iterrows():
@@ -273,6 +312,12 @@ try:
 
         try:
             if issue_type and issue_type.lower() == 'epic':
+                # Check if epic already exists
+                if check_issue_exists(project_name, DEFAULT_PROJECT_KEY):
+                    logger.info(f"Epic '{project_name}' already exists, skipping creation")
+                    skipped_issues.append(f"Epic: {project_name}")
+                    continue
+                
                 epic_fields['issuetype'] = {'name': 'Epic'}
                 if parent_link:
                     epic_fields['parent'] = {'key': parent_link}
@@ -280,8 +325,15 @@ try:
                     epic_fields['project'] = {'key': DEFAULT_PROJECT_KEY}
                 issue = jira.create_issue(fields=epic_fields)
                 logger.info(f"Epic created: {issue.key}")
+                created_issues.append(f"Epic: {project_name} ({issue.key})")
 
             elif issue_type and issue_type.lower() == 'qbv':
+                # Check if QBV already exists
+                if check_issue_exists(project_name, QBV_PROJECT_KEY):
+                    logger.info(f"QBV '{project_name}' already exists, skipping creation")
+                    skipped_issues.append(f"QBV: {project_name}")
+                    continue
+                
                 # Create QBV-specific fields
                 qbv_fields = {
                     'project': {'key': QBV_PROJECT_KEY},
@@ -307,6 +359,7 @@ try:
                 
                 issue = jira.create_issue(fields=qbv_fields)
                 logger.info(f"QBV issue created: {issue.key}")
+                created_issues.append(f"QBV: {project_name} ({issue.key})")
 
             elif issue_type and issue_type.lower() == 'project':
                 existing_issues = jira.search_issues(f'project="{DEFAULT_PROJECT_KEY}" AND summary~"{project_name}"')
@@ -328,13 +381,21 @@ try:
                     if fields_to_update:
                         issue.update(fields=fields_to_update)
                         logger.info(f"Project '{project_name}' updated: {issue.key}")
+                        created_issues.append(f"Project Update: {project_name} ({issue.key})")
                     else:
                         logger.info(f"No fields to update for project '{project_name}'")
+                        skipped_issues.append(f"Project Update: {project_name} (no fields to update)")
                 else:
                     logger.warning(f"Project '{project_name}' not found, cannot update.")
                     failed_tasks.append(f"Row {idx + 2}: {project_name} - Project not found, cannot update.")
 
             elif issue_type and issue_type.lower() == 'on-going':
+                # Check if ongoing issue already exists
+                if check_issue_exists(project_name, DEFAULT_PROJECT_KEY):
+                    logger.info(f"On-going issue '{project_name}' already exists, skipping creation")
+                    skipped_issues.append(f"On-going: {project_name}")
+                    continue
+                
                 # Create a new dictionary for ongoing issues instead of copying from epic_fields
                 story_fields = {
                     'project': {'key': DEFAULT_PROJECT_KEY},
@@ -358,6 +419,7 @@ try:
                 
                 issue = jira.create_issue(fields=story_fields)
                 logger.info(f"On-Going story created under ITDVPS-976: {issue.key}")
+                created_issues.append(f"On-going: {project_name} ({issue.key})")
 
             else:
                 logger.warning(f"Unknown issue type '{issue_type}' at row {idx + 2}")
@@ -369,6 +431,14 @@ try:
 
     # Add this before the final "Script execution completed" message
     logger.info("\n=== Execution Summary ===")
+    if created_issues:
+        logger.info("\nCreated/Updated Issues:")
+        for issue in created_issues:
+            logger.info(f"- {issue}")
+    if skipped_issues:
+        logger.info("\nSkipped Issues (already exist):")
+        for issue in skipped_issues:
+            logger.info(f"- {issue}")
     if failed_tasks:
         logger.warning("\nFailed Tasks:")
         for task in failed_tasks:
