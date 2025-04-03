@@ -26,7 +26,7 @@ if not logger.handlers:
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
 
-logger.info("Starting script execution...")
+logger.info("Starting QBV script execution...")
 logger.info("Current working directory: %s", os.getcwd())
 logger.info("Python version: %s", sys.version)
 
@@ -54,18 +54,13 @@ if missing_vars:
 logger.info(f"Using Jira URL: {JIRA_URL}")
 logger.info(f"Using Jira email: {JIRA_EMAIL}")
 
-DEFAULT_PROJECT_KEY = 'ITDVPS'
 QBV_PROJECT_KEY = 'CQ'
 
-# Custom fields
-DOD_FIELD_ID = 'customfield_10269'
-REQUESTED_BY_GROUP_FIELD_ID = 'customfield_10265'
-DOD_NEW_FIELD_ID = 'customfield_10115'
+# Custom fields for QBV
 DEST_TEAM_FIELD_ID = 'customfield_10114'
 YEAR_FIELD_ID = 'customfield_10268'
 QUARTER_FIELD_ID = 'customfield_10257'
-IN_QUARTER_PLAN_FIELD_ID = 'customfield_10239'
-QBV_GROUP_FIELD_ID = 'customfield_10256'  # Required field for QBV with CSI value
+GROUP_FIELD_ID = 'customfield_10256'  # Required field for QBV with CSI value
 
 # Connect to Jira
 jira = JIRA(server=JIRA_URL, basic_auth=(JIRA_EMAIL, JIRA_API_TOKEN))
@@ -151,7 +146,7 @@ def find_jira_user(search_value):
         logger.error(f"Failed to find user '{search_value}': {e}")
         return None
 
-def get_allowed_value_id(field_id, search_value, project_key=DEFAULT_PROJECT_KEY, issuetype='Epic'):
+def get_allowed_value_id(field_id, search_value, project_key=QBV_PROJECT_KEY, issuetype='QBV'):
     fields = jira.createmeta(projectKeys=project_key, issuetypeNames=issuetype, expand='projects.issuetypes.fields')
     allowed_list = []  # Initialize the list outside the loop
     
@@ -167,6 +162,20 @@ def get_allowed_value_id(field_id, search_value, project_key=DEFAULT_PROJECT_KEY
     # Only show allowed values if the search value wasn't found
     raise ValueError(f"Value '{search_value}' not found for field '{field_id}'. Allowed values: {allowed_list}")
 
+def field_exists_in_project(field_id, project_key=QBV_PROJECT_KEY, issuetype='QBV'):
+    """Check if a field exists in the project's issue type"""
+    try:
+        fields = jira.createmeta(projectKeys=project_key, issuetypeNames=issuetype, expand='projects.issuetypes.fields')
+        
+        for project in fields['projects']:
+            for issuetype in project['issuetypes']:
+                if field_id in issuetype['fields']:
+                    return True
+        return False
+    except Exception as e:
+        logger.error(f"Error checking if field {field_id} exists: {e}")
+        return False
+
 # Test issue creation with minimal fields
 try:
     # First verify authentication
@@ -181,25 +190,23 @@ try:
 
     # Try to get project info to verify permissions
     try:
-        project = jira.project(DEFAULT_PROJECT_KEY)
+        project = jira.project(QBV_PROJECT_KEY)
         logger.info(f"Successfully accessed project: {project.key} - {project.name}")
     except Exception as e:
-        logger.critical(f"Failed to access project {DEFAULT_PROJECT_KEY}: {e}")
+        logger.critical(f"Failed to access project {QBV_PROJECT_KEY}: {e}")
         logger.critical("Please verify you have permission to access this project")
         exit(1)
 
-    # Get the required field values
+    # Get the required field values for QBV
     try:
-        requested_by_group_id = get_allowed_value_id(REQUESTED_BY_GROUP_FIELD_ID, 'Dev')
+        # Default to Q2 for quarter
+        quarter_value_id = get_allowed_value_id(QUARTER_FIELD_ID, 'Q2')
         year_value_id = get_allowed_value_id(YEAR_FIELD_ID, '2025')
-        current_quarter = ((datetime.today().month - 1) // 3 + 1) % 4 + 1
-        quarter_value_id = get_allowed_value_id(QUARTER_FIELD_ID, f'Q{current_quarter}')
-        in_quarter_plan_yes_id = get_allowed_value_id(IN_QUARTER_PLAN_FIELD_ID, 'Yes')
         
-        # Get CSI value for QBV group field
-        qbv_group_value_id = get_allowed_value_id(QBV_GROUP_FIELD_ID, 'CSI', project_key=QBV_PROJECT_KEY, issuetype='QBV')
+        # Get CSI value for the group field
+        group_value_id = get_allowed_value_id(GROUP_FIELD_ID, 'CSI')
         
-        logger.info("Successfully got all required field values")
+        logger.info("Successfully got all required field values for QBV")
     except Exception as e:
         logger.critical(f"Failed to get required field values: {e}")
         exit(1)
@@ -221,7 +228,7 @@ try:
         exit(1)
 
     # Validate columns
-    expected_columns = ['Project name', 'Final DoD', 'Q2 DoD', 'Project Manager', 'Issue type', 'Description', 'lead', 'parent']
+    expected_columns = ['Project name', 'Final DoD', 'Q2 DoD', 'Project Manager', 'Issue type', 'Description', 'lead']
     missing_columns = [col for col in expected_columns if col not in df.columns]
     if missing_columns:
         logger.critical(f"The following columns are missing in the Excel file: {', '.join(missing_columns)}")
@@ -235,6 +242,11 @@ try:
 
     # Process rows
     for idx, row in df.iterrows():
+        # Only process rows with issue_type = 'qbv'
+        issue_type = row['Issue type'] if pd.notna(row['Issue type']) else None
+        if not issue_type or issue_type.lower() != 'qbv':
+            continue
+            
         project_name = str(row['Project name']).replace('"', "'")
         
         # Get Project Manager's account ID for proper mention
@@ -245,123 +257,33 @@ try:
         description = f"{row['Description']} \n\n**Final DoD:** {row['Final DoD']}\n**Project Manager:** {project_manager_mention}"
         dod_content = str(row['Q2 DoD']) if pd.notna(row['Q2 DoD']) else ""  # Handle NaN values
         lead = row['lead'] if pd.notna(row['lead']) else None
-        issue_type = row['Issue type'] if pd.notna(row['Issue type']) else None
-        parent_link = row['parent'] if pd.notna(row['parent']) else None
 
-        epic_fields = {
-            'project': {'key': DEFAULT_PROJECT_KEY},
+        # Create QBV fields with only the specified fields
+        qbv_fields = {
+            'project': {'key': QBV_PROJECT_KEY},
             'summary': project_name,
             'description': description,
-            DOD_FIELD_ID: dod_content,
-            REQUESTED_BY_GROUP_FIELD_ID: requested_by_group_id,
-            DOD_NEW_FIELD_ID: dod_content,
+            'issuetype': {'id': '10222'},  # QBV issue type ID
             DEST_TEAM_FIELD_ID: {'value': 'IT_DevOps Team'},
             YEAR_FIELD_ID: year_value_id,
             QUARTER_FIELD_ID: quarter_value_id,
-            IN_QUARTER_PLAN_FIELD_ID: in_quarter_plan_yes_id,
+            GROUP_FIELD_ID: group_value_id,  # CSI group
             'labels': ['excel2jira']
         }
-
+        
         # Handle user assignment
         if lead:
             user_account_id = find_jira_user(lead)
             if user_account_id:
-                epic_fields['assignee'] = {'accountId': user_account_id}
+                qbv_fields['assignee'] = {'accountId': user_account_id}
             else:
                 logger.warning(f"Could not find Jira user for lead '{lead}' at row {idx + 2}")
                 failed_users.append(f"Row {idx + 2}: {project_name} - Could not find Jira user for lead '{lead}'")
 
         try:
-            if issue_type and issue_type.lower() == 'epic':
-                epic_fields['issuetype'] = {'name': 'Epic'}
-                if parent_link:
-                    epic_fields['parent'] = {'key': parent_link}
-                else:
-                    epic_fields['project'] = {'key': DEFAULT_PROJECT_KEY}
-                issue = jira.create_issue(fields=epic_fields)
-                logger.info(f"Epic created: {issue.key}")
-
-            elif issue_type and issue_type.lower() == 'qbv':
-                # Create QBV-specific fields
-                qbv_fields = {
-                    'project': {'key': QBV_PROJECT_KEY},
-                    'summary': project_name,
-                    'description': description,
-                    'issuetype': {'id': '10222'},  # QBV issue type ID
-                    DEST_TEAM_FIELD_ID: {'value': 'IT_DevOps Team'},
-                    YEAR_FIELD_ID: year_value_id,
-                    QUARTER_FIELD_ID: quarter_value_id,
-                    QBV_GROUP_FIELD_ID: qbv_group_value_id,  # CSI group
-                    DOD_NEW_FIELD_ID: dod_content,  # Only use DOD NEW field
-                    'labels': ['excel2jira']
-                }
-                
-                # Handle user assignment for QBV
-                if lead:
-                    user_account_id = find_jira_user(lead)
-                    if user_account_id:
-                        qbv_fields['assignee'] = {'accountId': user_account_id}
-                    else:
-                        logger.warning(f"Could not find Jira user for lead '{lead}' at row {idx + 2}")
-                        failed_users.append(f"Row {idx + 2}: {project_name} - Could not find Jira user for lead '{lead}'")
-                
-                issue = jira.create_issue(fields=qbv_fields)
-                logger.info(f"QBV issue created: {issue.key}")
-
-            elif issue_type and issue_type.lower() == 'project':
-                existing_issues = jira.search_issues(f'project="{DEFAULT_PROJECT_KEY}" AND summary~"{project_name}"')
-                if existing_issues:
-                    issue = existing_issues[0]
-                    # Check existing fields and preserve them
-                    current_fields = issue.fields
-                    fields_to_update = {}
-                    for field, value in epic_fields.items():
-                        if hasattr(current_fields, field):
-                            current_value = getattr(current_fields, field)
-                            if current_value and str(current_value).strip():
-                                logger.warning(f"Field {field} already contains data in issue {issue.key}: {current_value}")
-                            else:
-                                fields_to_update[field] = value
-                        else:
-                            fields_to_update[field] = value
-                    
-                    if fields_to_update:
-                        issue.update(fields=fields_to_update)
-                        logger.info(f"Project '{project_name}' updated: {issue.key}")
-                    else:
-                        logger.info(f"No fields to update for project '{project_name}'")
-                else:
-                    logger.warning(f"Project '{project_name}' not found, cannot update.")
-                    failed_tasks.append(f"Row {idx + 2}: {project_name} - Project not found, cannot update.")
-
-            elif issue_type and issue_type.lower() == 'on-going':
-                # Create a new dictionary for ongoing issues instead of copying from epic_fields
-                story_fields = {
-                    'project': {'key': DEFAULT_PROJECT_KEY},
-                    'summary': project_name,
-                    'description': description,
-                    'issuetype': {'name': 'Story'},
-                    'parent': {'key': 'ITDVPS-976'},
-                    DOD_NEW_FIELD_ID: dod_content,  # Only use DOD NEW field
-                    DEST_TEAM_FIELD_ID: {'value': 'IT_DevOps Team'},
-                    'labels': ['excel2jira']
-                }
-                
-                # Handle user assignment
-                if lead:
-                    user_account_id = find_jira_user(lead)
-                    if user_account_id:
-                        story_fields['assignee'] = {'accountId': user_account_id}
-                    else:
-                        logger.warning(f"Could not find Jira user for lead '{lead}' at row {idx + 2}")
-                        failed_users.append(f"Row {idx + 2}: {project_name} - Could not find Jira user for lead '{lead}'")
-                
-                issue = jira.create_issue(fields=story_fields)
-                logger.info(f"On-Going story created under ITDVPS-976: {issue.key}")
-
-            else:
-                logger.warning(f"Unknown issue type '{issue_type}' at row {idx + 2}")
-                failed_tasks.append(f"Row {idx + 2}: {project_name} - Unknown issue type '{issue_type}'")
+            # Create QBV issue
+            issue = jira.create_issue(fields=qbv_fields)
+            logger.info(f"QBV issue created: {issue.key}")
 
         except Exception as e:
             logger.error(f"Failed at row {idx + 2} ('{project_name}'): {e}")
@@ -383,10 +305,10 @@ try:
             logger.warning(f"- {field}")
 
     if not any([failed_tasks, failed_users, failed_fields]):
-        logger.info("All tasks completed successfully!")
+        logger.info("All QBV tasks completed successfully!")
 
 except Exception as e:
     logger.error(f"Script failed: {e}")
     exit(1)
 
-logger.info("Script execution completed.")
+logger.info("QBV script execution completed.") 
