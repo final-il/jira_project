@@ -65,25 +65,26 @@ python excel2jira-v2.py [options]
 
 ### Options
 
+- `-d, --data PATH`: Path to the Excel file containing issue data (required)
 - `-p, --project PROJECT`: Project key (default: ITDVPS)
 - `-q, --quarter {Q1,Q2,Q3,Q4}`: Quarter (Q1, Q2, Q3, Q4). If not provided, will use next quarter
 - `-u, --update`: Update existing issues instead of skipping them
 
 ### Examples
 
-Create issues in the default project (ITDVPS) with the next quarter:
+Create issues from a specific Excel file in the default project (ITDVPS) with the next quarter:
 ```
-python excel2jira-v2.py
-```
-
-Create issues in a specific project with a specific quarter:
-```
-python excel2jira-v2.py -p CUSTOM -q Q2
+python excel2jira-v2.py -d path/to/your/excel/file.xlsx
 ```
 
-Update existing issues instead of skipping them:
+Create issues from a specific Excel file in a specific project with a specific quarter:
 ```
-python excel2jira-v2.py -u
+python excel2jira-v2.py -d path/to/your/excel/file.xlsx -p CUSTOM -q Q2
+```
+
+Update existing issues from a specific Excel file instead of skipping them:
+```
+python excel2jira-v2.py -d path/to/your/excel/file.xlsx -u
 ```
 
 ## Issue Types and Fields

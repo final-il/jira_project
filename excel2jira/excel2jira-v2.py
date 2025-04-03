@@ -161,7 +161,6 @@ def get_allowed_value_id(field_id, search_value, project_key=DEFAULT_PROJECT_KEY
     # Only show allowed values if the search value wasn't found
     raise ValueError(f"Value '{search_value}' not found for field '{field_id}'. Allowed values: {allowed_list}")
 
-# Add this before the script execution
 def parse_arguments():
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(description='Create Jira issues from Excel file')
@@ -171,12 +170,73 @@ def parse_arguments():
                         help='Quarter (Q1, Q2, Q3, Q4). If not provided, will use next quarter')
     parser.add_argument('-u', '--update', action='store_true',
                         help='Update existing issues instead of skipping them')
+    parser.add_argument('-d', '--data', type=str, required=True,
+                        help='Path to the Excel file containing issue data')
+    parser.add_argument('-v', '--verbose', action='count', default=0,
+                        help='Increase verbosity level (-v for INFO, -vv for DEBUG)')
+    parser.add_argument('--debug', action='store_true',
+                        help='Enable debug mode (same as -vv)')
     return parser.parse_args()
+
+def setup_logging(verbosity_level):
+    """Setup logging configuration based on verbosity level"""
+    # Remove any existing handlers
+    root = logging.getLogger()
+    if root.handlers:
+        for handler in root.handlers:
+            root.removeHandler(handler)
+    
+    # Set default level to WARNING (minimal output)
+    log_level = logging.WARNING
+    
+    # Adjust level based on verbosity
+    if verbosity_level >= 3 or args.debug:  # -vvv or --debug
+        log_level = logging.DEBUG
+    elif verbosity_level == 2:  # -vv
+        log_level = logging.DEBUG
+    elif verbosity_level == 1:  # -v
+        log_level = logging.INFO
+    
+    # Configure logging
+    logging.basicConfig(
+        level=log_level,
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    
+    # Add console handler if none exists
+    if not root.handlers:
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
+        root.addHandler(console_handler)
+    
+    logger.info(f"Logging level set to: {logging.getLevelName(log_level)}")
+
+def process_labels(label_str):
+    """Process labels string into a list of labels, case insensitive"""
+    if pd.isna(label_str):
+        return []
+    # Split by comma and strip whitespace from each label
+    labels = [label.strip() for label in str(label_str).split(',')]
+    # Filter out empty labels and convert to lowercase for case-insensitive comparison
+    labels = [label for label in labels if label]
+    # Remove duplicates (case insensitive)
+    unique_labels = []
+    seen = set()
+    for label in labels:
+        label_lower = label.lower()
+        if label_lower not in seen:
+            seen.add(label_lower)
+            unique_labels.append(label)  # Keep original case
+    return unique_labels
 
 # Test issue creation with minimal fields
 try:
     # Parse command line arguments
     args = parse_arguments()
+    
+    # Setup logging based on verbosity level
+    setup_logging(args.verbose)
     
     # Set project key from command line argument
     DEFAULT_PROJECT_KEY = args.project
@@ -227,7 +287,7 @@ try:
         exit(1)
 
     # Process Excel file
-    excel_file = r'C:\Users\Maorb\Documents\Devops-plan-25Q2.xlsx'
+    excel_file = args.data
     try:
         if not os.path.exists(excel_file):
             logger.critical(f"Excel file not found at: {excel_file}")
@@ -237,13 +297,38 @@ try:
         df = pd.read_excel(excel_file, engine='openpyxl')
         logger.info(f"Excel file '{excel_file}' loaded successfully.")
         logger.info(f"Found {len(df)} rows to process")
+        
+        # Convert column names to lowercase for case-insensitive comparison
+        df.columns = [col.lower() for col in df.columns]
+        
+        # Log detailed information about the DataFrame
+        logger.info("Excel file structure:")
+        logger.info(f"Columns found: {', '.join(df.columns)}")
+        logger.info(f"First row data: {df.iloc[0].to_dict()}")
+        
+        # Check if Labels column exists, if not create it with default label
+        if 'labels' not in df.columns:
+            logger.warning("'Labels' column not found in Excel file. Creating default label 'excel2jira'.")
+            df['labels'] = [['excel2jira'] for _ in range(len(df))]
+        else:
+            # Process labels for all rows
+            df['labels'] = df['labels'].apply(process_labels)
+            # If any row has no labels, add the default label
+            df['labels'] = df['labels'].apply(lambda x: ['excel2jira'] if not x else x)
+            logger.info("Successfully processed labels from Excel file")
+            
+        # Log sample of processed labels
+        logger.info("Sample of processed labels:")
+        for i in range(min(3, len(df))):
+            logger.info(f"Row {i + 1} labels: {df['labels'].iloc[i]}")
+        
     except Exception as e:
         logger.critical(f"Failed loading Excel file: {e}")
         logger.critical(f"Please ensure the file '{excel_file}' exists and is accessible")
         exit(1)
 
     # Validate columns
-    expected_columns = ['Project name', 'Final DoD', 'Q2 DoD', 'Project Manager', 'Issue type', 'Description', 'lead', 'parent']
+    expected_columns = ['project name', 'final dod', 'q2 dod', 'project manager', 'issue type', 'description', 'lead', 'parent']
     missing_columns = [col for col in expected_columns if col not in df.columns]
     if missing_columns:
         logger.critical(f"The following columns are missing in the Excel file: {', '.join(missing_columns)}")
@@ -279,17 +364,17 @@ try:
 
     # Process rows
     for idx, row in df.iterrows():
-        project_name = str(row['Project name']).replace('"', "'")
+        project_name = str(row['project name']).replace('"', "'")
         
         # Get Project Manager's account ID for proper mention
-        project_manager_account_id = find_jira_user(row['Project Manager'])
-        project_manager_mention = f"@[~{project_manager_account_id}]" if project_manager_account_id else f"@{row['Project Manager']}"
+        project_manager_account_id = find_jira_user(row['project manager'])
+        project_manager_mention = f"@[~{project_manager_account_id}]" if project_manager_account_id else f"@{row['project manager']}"
         
         # Format the description with proper Jira mentions
-        description = f"{row['Description']} \n\n**Final DoD:** {row['Final DoD']}\n**Project Manager:** {project_manager_mention}"
-        dod_content = str(row['Q2 DoD']) if pd.notna(row['Q2 DoD']) else ""  # Handle NaN values
+        description = f"{row['description']} \n\n**Final DoD:** {row['final dod']}\n**Project Manager:** {project_manager_mention}"
+        dod_content = str(row['q2 dod']) if pd.notna(row['q2 dod']) else ""  # Handle NaN values
         lead = row['lead'] if pd.notna(row['lead']) else None
-        issue_type = row['Issue type'] if pd.notna(row['Issue type']) else None
+        issue_type = row['issue type'] if pd.notna(row['issue type']) else None
         parent_link = row['parent'] if pd.notna(row['parent']) else None
 
         epic_fields = {
@@ -303,7 +388,7 @@ try:
             YEAR_FIELD_ID: year_value_id,
             QUARTER_FIELD_ID: quarter_value_id,
             IN_QUARTER_PLAN_FIELD_ID: in_quarter_plan_yes_id,
-            'labels': ['excel2jira']
+            'labels': row['labels']
         }
 
         # Handle user assignment
@@ -365,7 +450,7 @@ try:
                     QUARTER_FIELD_ID: quarter_value_id,
                     QBV_GROUP_FIELD_ID: qbv_group_value_id,  # CSI group
                     DOD_NEW_FIELD_ID: dod_content,  # Only use DOD NEW field
-                    'labels': ['excel2jira']
+                    'labels': row['labels']
                 }
                 
                 # Handle user assignment for QBV
@@ -439,7 +524,7 @@ try:
                     'parent': {'key': 'ITDVPS-976'},
                     DOD_NEW_FIELD_ID: dod_content,  # Only use DOD NEW field
                     DEST_TEAM_FIELD_ID: {'value': 'IT_DevOps Team'},
-                    'labels': ['excel2jira']
+                    'labels': row['labels']
                 }
                 
                 # Handle user assignment
