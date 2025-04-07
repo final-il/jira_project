@@ -7,6 +7,7 @@ import logging
 from difflib import SequenceMatcher
 import sys
 import argparse  # Add this import
+import re
 
 # Check if the root logger already has handlers
 if not logging.getLogger().handlers:
@@ -197,7 +198,7 @@ def setup_logging(verbosity_level):
     elif verbosity_level == 1:  # -v
         log_level = logging.INFO
     
-    # Configure logging
+    # Configure logging with a simpler format for better copy-paste
     logging.basicConfig(
         level=log_level,
         format='%(asctime)s [%(levelname)s] %(message)s',
@@ -207,7 +208,9 @@ def setup_logging(verbosity_level):
     # Add console handler if none exists
     if not root.handlers:
         console_handler = logging.StreamHandler()
-        console_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
+        # Use a simpler formatter without any special characters
+        formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
+        console_handler.setFormatter(formatter)
         root.addHandler(console_handler)
     
     logger.info(f"Logging level set to: {logging.getLevelName(log_level)}")
@@ -229,6 +232,29 @@ def process_labels(label_str):
             seen.add(label_lower)
             unique_labels.append(label)  # Keep original case
     return unique_labels
+
+def clean_dod_field(dod_content):
+    """Clean up DOD field content by removing newlines, extra spaces, and special characters"""
+    if pd.isna(dod_content):
+        return ""
+    
+    # Convert to string
+    dod_str = str(dod_content)
+    
+    # Replace newlines with spaces
+    dod_str = dod_str.replace('\n', ' ').replace('\r', ' ')
+    
+    # Replace multiple spaces with a single space
+    dod_str = ' '.join(dod_str.split())
+    
+    # Remove special characters (keep only alphanumeric, spaces, and basic punctuation)
+    dod_str = re.sub(r'[^\w\s.,;:()\-]', '', dod_str)
+    
+    # Truncate to 255 characters if needed
+    if len(dod_str) > 255:
+        dod_str = dod_str[:252] + "..."
+    
+    return dod_str
 
 # Test issue creation with minimal fields
 try:
@@ -354,12 +380,28 @@ try:
             return False
 
     def update_issue_fields(issue, fields_to_update):
-        """Update fields of an existing issue"""
+        """Update fields for an existing issue"""
         try:
+            # First verify the issue exists
+            try:
+                jira.issue(issue.key)
+                logger.debug(f"Issue {issue.key} exists and is accessible")
+            except Exception as e:
+                logger.error(f"Issue {issue.key} does not exist in Jira: {str(e)}")
+                return False
+            
+            # Log the fields being updated for debugging
+            logger.debug(f"Updating issue {issue.key} with fields: {fields_to_update}")
+            
+            # Update the issue
             issue.update(fields=fields_to_update)
+            logger.info(f"Successfully updated fields for issue {issue.key}")
             return True
         except Exception as e:
-            logger.error(f"Failed to update issue {issue.key}: {e}")
+            logger.error(f"Failed to update fields for issue {issue.key}: {str(e)}")
+            # Log more details about the error
+            if hasattr(e, 'response') and hasattr(e.response, 'text'):
+                logger.error(f"Error response: {e.response.text}")
             return False
 
     # Process rows
@@ -372,7 +414,13 @@ try:
         
         # Format the description with proper Jira mentions
         description = f"{row['description']} \n\n**Final DoD:** {row['final dod']}\n**Project Manager:** {project_manager_mention}"
-        dod_content = str(row['q2 dod']) if pd.notna(row['q2 dod']) else ""  # Handle NaN values
+        
+        # Clean up the DOD field (customfield_10269)
+        dod_content_cleaned = clean_dod_field(row['q2 dod'])
+        
+        # Keep the original DOD content for customfield_10115
+        dod_content = str(row['q2 dod']) if pd.notna(row['q2 dod']) else ""
+        
         lead = row['lead'] if pd.notna(row['lead']) else None
         issue_type = row['issue type'] if pd.notna(row['issue type']) else None
         parent_link = row['parent'] if pd.notna(row['parent']) else None
@@ -381,9 +429,9 @@ try:
             'project': {'key': DEFAULT_PROJECT_KEY},
             'summary': project_name,
             'description': description,
-            DOD_FIELD_ID: dod_content,
+            DOD_FIELD_ID: dod_content_cleaned,  # Use cleaned DOD content
             REQUESTED_BY_GROUP_FIELD_ID: requested_by_group_id,
-            DOD_NEW_FIELD_ID: dod_content,
+            DOD_NEW_FIELD_ID: dod_content,  # Keep original DOD content
             DEST_TEAM_FIELD_ID: {'value': 'IT_DevOps Team'},
             YEAR_FIELD_ID: year_value_id,
             QUARTER_FIELD_ID: quarter_value_id,
@@ -449,7 +497,7 @@ try:
                     YEAR_FIELD_ID: year_value_id,
                     QUARTER_FIELD_ID: quarter_value_id,
                     QBV_GROUP_FIELD_ID: qbv_group_value_id,  # CSI group
-                    DOD_NEW_FIELD_ID: dod_content,  # Only use DOD NEW field
+                    DOD_NEW_FIELD_ID: dod_content,  # Keep original DOD content
                     'labels': row['labels']
                 }
                 
@@ -477,78 +525,125 @@ try:
                     created_issues.append(f"QBV: {project_name} ({issue.key})")
 
             elif issue_type and issue_type.lower() == 'project':
-                existing_issues = jira.search_issues(f'project="{DEFAULT_PROJECT_KEY}" AND summary~"{project_name}"')
-                if existing_issues:
-                    issue = existing_issues[0]
-                    # Check existing fields and preserve them
-                    current_fields = issue.fields
-                    fields_to_update = {}
-                    for field, value in epic_fields.items():
-                        if hasattr(current_fields, field):
-                            current_value = getattr(current_fields, field)
-                            if current_value and str(current_value).strip():
-                                logger.warning(f"Field {field} already contains data in issue {issue.key}: {current_value}")
+                try:
+                    # Log the exact search query being used
+                    search_query = f'project = "{DEFAULT_PROJECT_KEY}" AND summary ~ "\\"' + project_name + '\\""'
+                    logger.debug(f"Searching for project with query: {search_query}")
+                    
+                    existing_issues = jira.search_issues(search_query)
+                    logger.debug(f"Search results for '{project_name}': {len(existing_issues)} issues found")
+                    
+                    if existing_issues:
+                        issue = existing_issues[0]
+                        logger.debug(f"Found project issue: {issue.key} - {issue.fields.summary}")
+                        # Check existing fields and preserve them
+                        current_fields = issue.fields
+                        fields_to_update = {}
+                        for field, value in epic_fields.items():
+                            if hasattr(current_fields, field):
+                                current_value = getattr(current_fields, field)
+                                if current_value and str(current_value).strip():
+                                    logger.warning(f"Field {field} already contains data in issue {issue.key}: {current_value}")
+                                else:
+                                    fields_to_update[field] = value
                             else:
                                 fields_to_update[field] = value
+                        
+                        if fields_to_update:
+                            logger.debug(f"Fields to update for project '{project_name}': {fields_to_update}")
+                            if update_issue_fields(issue, fields_to_update):
+                                logger.info(f"Project '{project_name}' updated: {issue.key}")
+                                updated_issues.append(f"Project Update: {project_name} ({issue.key})")
+                            else:
+                                failed_tasks.append(f"Row {idx + 2}: {project_name} - Failed to update project")
                         else:
-                            fields_to_update[field] = value
-                    
-                    if fields_to_update:
-                        if update_issue_fields(issue, fields_to_update):
-                            logger.info(f"Project '{project_name}' updated: {issue.key}")
-                            updated_issues.append(f"Project Update: {project_name} ({issue.key})")
-                        else:
-                            failed_tasks.append(f"Row {idx + 2}: {project_name} - Failed to update project")
+                            logger.info(f"No fields to update for project '{project_name}'")
+                            skipped_issues.append(f"Project Update: {project_name} (no fields to update)")
                     else:
-                        logger.info(f"No fields to update for project '{project_name}'")
-                        skipped_issues.append(f"Project Update: {project_name} (no fields to update)")
-                else:
-                    logger.warning(f"Project '{project_name}' not found, cannot update.")
-                    failed_tasks.append(f"Row {idx + 2}: {project_name} - Project not found, cannot update.")
+                        # Try a broader search to see if the issue exists with a slightly different name
+                        broader_search = f'project = "{DEFAULT_PROJECT_KEY}" AND summary ~ "' + project_name.split()[0] + '"'
+                        logger.debug(f"Trying broader search: {broader_search}")
+                        broader_results = jira.search_issues(broader_search)
+                        if broader_results:
+                            logger.warning(f"Project '{project_name}' not found with exact name, but found similar issues:")
+                            for result in broader_results:
+                                logger.warning(f"  - {result.key}: {result.fields.summary}")
+                        
+                        logger.warning(f"Project '{project_name}' not found, cannot update.")
+                        failed_tasks.append(f"Row {idx + 2}: {project_name} - Project not found, cannot update.")
+                except Exception as e:
+                    logger.error(f"Error processing project '{project_name}': {str(e)}")
+                    if hasattr(e, 'response') and hasattr(e.response, 'text'):
+                        logger.error(f"Error response: {e.response.text}")
+                    failed_tasks.append(f"Row {idx + 2}: {project_name} - Error: {str(e)}")
 
             elif issue_type and issue_type.lower() == 'on-going':
-                # Check if ongoing issue already exists
-                existing_issues = jira.search_issues(f'project="{DEFAULT_PROJECT_KEY}" AND summary~"{project_name}"', maxResults=1)
-                
-                if existing_issues and not args.update:
-                    logger.info(f"On-going issue '{project_name}' already exists, skipping creation")
-                    skipped_issues.append(f"On-going: {project_name}")
-                    continue
-                
-                # Create a new dictionary for ongoing issues instead of copying from epic_fields
-                story_fields = {
-                    'project': {'key': DEFAULT_PROJECT_KEY},
-                    'summary': project_name,
-                    'description': description,
-                    'issuetype': {'name': 'Story'},
-                    'parent': {'key': 'ITDVPS-976'},
-                    DOD_NEW_FIELD_ID: dod_content,  # Only use DOD NEW field
-                    DEST_TEAM_FIELD_ID: {'value': 'IT_DevOps Team'},
-                    'labels': row['labels']
-                }
-                
-                # Handle user assignment
-                if lead:
-                    user_account_id = find_jira_user(lead)
-                    if user_account_id:
-                        story_fields['assignee'] = {'accountId': user_account_id}
+                try:
+                    # Check if ongoing issue already exists
+                    search_query = f'project = "{DEFAULT_PROJECT_KEY}" AND summary ~ "\\"' + project_name + '\\""'
+                    logger.debug(f"Searching for on-going issue with query: {search_query}")
+                    
+                    existing_issues = jira.search_issues(search_query, maxResults=1)
+                    logger.debug(f"Search results for on-going '{project_name}': {len(existing_issues)} issues found")
+                    
+                    if existing_issues and not args.update:
+                        logger.info(f"On-going issue '{project_name}' already exists, skipping creation")
+                        skipped_issues.append(f"On-going: {project_name}")
+                        continue
+                    
+                    # Create a new dictionary for ongoing issues instead of copying from epic_fields
+                    story_fields = {
+                        'project': {'key': DEFAULT_PROJECT_KEY},
+                        'summary': project_name,
+                        'description': description,
+                        'issuetype': {'name': 'Story'},
+                        'parent': {'key': 'ITDVPS-976'},
+                        DOD_NEW_FIELD_ID: dod_content,  # Keep original DOD content
+                        DEST_TEAM_FIELD_ID: {'value': 'IT_DevOps Team'},
+                        'labels': row['labels']
+                    }
+                    
+                    # Handle user assignment
+                    if lead:
+                        user_account_id = find_jira_user(lead)
+                        if user_account_id:
+                            story_fields['assignee'] = {'accountId': user_account_id}
+                        else:
+                            logger.warning(f"Could not find Jira user for lead '{lead}' at row {idx + 2}")
+                            failed_users.append(f"Row {idx + 2}: {project_name} - Could not find Jira user for lead '{lead}'")
+                    
+                    if existing_issues and args.update:
+                        # Update existing ongoing issue
+                        issue = existing_issues[0]
+                        logger.debug(f"Found on-going issue: {issue.key} - {issue.fields.summary}")
+                        logger.debug(f"Current fields of on-going issue {issue.key}:")
+                        for field in story_fields:
+                            if hasattr(issue.fields, field):
+                                current_value = getattr(issue.fields, field)
+                                logger.debug(f"  - {field}: {current_value}")
+                        
+                        logger.debug(f"Updating on-going issue {issue.key} with fields: {story_fields}")
+                        try:
+                            if update_issue_fields(issue, story_fields):
+                                logger.info(f"On-going issue updated: {issue.key}")
+                                updated_issues.append(f"On-going: {project_name} ({issue.key})")
+                            else:
+                                failed_tasks.append(f"Row {idx + 2}: {project_name} - Failed to update on-going issue")
+                        except Exception as update_error:
+                            logger.error(f"Error updating on-going issue {issue.key}: {str(update_error)}")
+                            if hasattr(update_error, 'response') and hasattr(update_error.response, 'text'):
+                                logger.error(f"Update error response: {update_error.response.text}")
+                            failed_tasks.append(f"Row {idx + 2}: {project_name} - Update error: {str(update_error)}")
                     else:
-                        logger.warning(f"Could not find Jira user for lead '{lead}' at row {idx + 2}")
-                        failed_users.append(f"Row {idx + 2}: {project_name} - Could not find Jira user for lead '{lead}'")
-                
-                if existing_issues and args.update:
-                    # Update existing ongoing issue
-                    issue = existing_issues[0]
-                    if update_issue_fields(issue, story_fields):
-                        logger.info(f"On-going issue updated: {issue.key}")
-                        updated_issues.append(f"On-going: {project_name} ({issue.key})")
-                    else:
-                        failed_tasks.append(f"Row {idx + 2}: {project_name} - Failed to update on-going issue")
-                else:
-                    # Create new ongoing issue
-                    issue = jira.create_issue(fields=story_fields)
-                    logger.info(f"On-Going story created under ITDVPS-976: {issue.key}")
-                    created_issues.append(f"On-going: {project_name} ({issue.key})")
+                        # Create new ongoing issue
+                        issue = jira.create_issue(fields=story_fields)
+                        logger.info(f"On-Going story created under ITDVPS-976: {issue.key}")
+                        created_issues.append(f"On-going: {project_name} ({issue.key})")
+                except Exception as e:
+                    logger.error(f"Error processing on-going issue '{project_name}': {str(e)}")
+                    if hasattr(e, 'response') and hasattr(e.response, 'text'):
+                        logger.error(f"Error response: {e.response.text}")
+                    failed_tasks.append(f"Row {idx + 2}: {project_name} - Error: {str(e)}")
 
             else:
                 logger.warning(f"Unknown issue type '{issue_type}' at row {idx + 2}")
@@ -559,29 +654,29 @@ try:
             failed_tasks.append(f"Row {idx + 2}: {project_name} - {str(e)}")
 
     # Add this before the final "Script execution completed" message
-    logger.info("\n=== Execution Summary ===")
+    logger.info("=== Execution Summary ===")
     if created_issues:
-        logger.info("\nCreated Issues:")
+        logger.info("Created Issues:")
         for issue in created_issues:
             logger.info(f"- {issue}")
     if updated_issues:
-        logger.info("\nUpdated Issues:")
+        logger.info("Updated Issues:")
         for issue in updated_issues:
             logger.info(f"- {issue}")
     if skipped_issues:
-        logger.info("\nSkipped Issues (already exist):")
+        logger.info("Skipped Issues (already exist):")
         for issue in skipped_issues:
             logger.info(f"- {issue}")
     if failed_tasks:
-        logger.warning("\nFailed Tasks:")
+        logger.warning("Failed Tasks:")
         for task in failed_tasks:
             logger.warning(f"- {task}")
     if failed_users:
-        logger.warning("\nFailed User Assignments:")
+        logger.warning("Failed User Assignments:")
         for user in failed_users:
             logger.warning(f"- {user}")
     if failed_fields:
-        logger.warning("\nFailed Field Updates:")
+        logger.warning("Failed Field Updates:")
         for field in failed_fields:
             logger.warning(f"- {field}")
 
